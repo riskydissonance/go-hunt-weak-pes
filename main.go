@@ -15,21 +15,24 @@ func main() {
 	config := getConfig()
 	if strings.Contains(config.paths, ",") {
 		for _, path := range strings.Split(config.paths, ",") {
-			walkDirectory(&path, config.allChecks, config.verbose)
+			walkDirectory(&path, config.allChecks, config.verbose, config.justExes, config.justDlls)
 		}
 	} else {
-		walkDirectory(&config.paths, config.allChecks, config.verbose)
+		walkDirectory(&config.paths, config.allChecks, config.verbose, config.justExes, config.justDlls)
 	}
 }
 
-func walkDirectory(path *string, allChecks bool, verbose bool) {
-	err := filepath.Walk(*path, func(path string, info os.FileInfo, err error) error {
+func walkDirectory(pPath *string, allChecks bool, verbose bool, justExes bool, justDlls bool) {
+	err := filepath.Walk(*pPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			fmt.Println(err)
+			if verbose {
+				fmt.Println(err)
+			}
 			return nil
 		}
-		if filepath.Ext(path) == ".exe" || filepath.Ext(path) == ".dll" {
-			check(path, allChecks, verbose)
+		if (!justDlls && strings.EqualFold(filepath.Ext(path), ".exe")) ||
+			(!justExes && strings.EqualFold(filepath.Ext(path), ".dll")) {
+			checkPE(path, allChecks, verbose)
 		}
 		return nil
 	})
@@ -38,123 +41,68 @@ func walkDirectory(path *string, allChecks bool, verbose bool) {
 	}
 }
 
-func check(name string, allChecks bool, verbose bool) {
+func checkPE(name string, allChecks bool, verbose bool) {
+
 	if verbose {
 		fmt.Printf("[*] Checking: %s\n", name)
 	}
-	file, err := pe.Open(name)
-	if err != nil {
-		return
-	}
-	var noNx bool
-	var noAslr bool
-	var noSeh bool
-	var noCfg bool
-	var noIntegrityChecks bool
-	var is64bit bool
 
-	var sizeofOptionalHeader32 = uint16(binary.Size(pe.OptionalHeader32{}))
-	var sizeofOptionalHeader64 = uint16(binary.Size(pe.OptionalHeader64{}))
-	var optionalHeader32 pe.OptionalHeader32
-	var optionalHeader64 pe.OptionalHeader64
+	var (
+		noNx              bool
+		noAslr            bool
+		noSeh             bool
+		noCfg             bool
+		noIntegrityChecks bool
+		is64bit           bool
+
+		optionalHeader32 pe.OptionalHeader32
+		optionalHeader64 pe.OptionalHeader64
+	)
 
 	ioFile, err := os.Open(name)
 	if err != nil {
-		fmt.Printf("[-] Could not open file for reading:%s - %s\n", name, err)
+		if verbose {
+			fmt.Printf("[-] Could not open peFile for reading: %s - %s\n", name, err)
+		}
 		return
 	}
-	var dosHeader [96]byte
-	var sign [4]byte
-	_, err = ioFile.ReadAt(dosHeader[0:], 0)
-	if err != nil {
-		fmt.Printf("[-] Could not read Image Header: %s\n", err)
-		return
-	}
-	var base int64
-	if dosHeader[0] == 'M' && dosHeader[1] == 'Z' {
-		signOff := int64(binary.LittleEndian.Uint32(dosHeader[0x3c:]))
-		_, err := ioFile.ReadAt(sign[:], signOff)
-		if err != nil {
-			fmt.Printf("[-] Could not read Image Header: %s\n", err)
-			return
-		}
-		if !(sign[0] == 'P' && sign[1] == 'E' && sign[2] == 0 && sign[3] == 0) {
-			fmt.Printf("Invalid PE File Format.\n")
-		}
-		base = signOff + 4
-	} else {
-		base = int64(0)
-	}
-	sr := io.NewSectionReader(ioFile, 0, 1<<63-1)
-	_, err = sr.Seek(base, os.SEEK_SET)
-	if err != nil {
-		fmt.Printf("[-] Could not seek in file: %s\n", err)
-		return
-	}
-	err = binary.Read(sr, binary.LittleEndian, &file.FileHeader)
-	if err != nil {
-		fmt.Printf("[-] Could not read Image Header: %s\n", err)
-		return
-	}
-	switch file.FileHeader.SizeOfOptionalHeader {
-	case sizeofOptionalHeader32:
-		err := binary.Read(sr, binary.LittleEndian, &optionalHeader32)
-		if err != nil {
-			fmt.Printf("[-] Could not read Image Optional Header: %s\n", err)
-			return
-		}
-		if optionalHeader32.Magic != 0x10b { // PE32
-			fmt.Printf("[-] pe32 optional header has unexpected Magic of 0x%x\n", optionalHeader32.Magic)
-			return
-		}
-		is64bit = false
 
-	case sizeofOptionalHeader64:
-		err := binary.Read(sr, binary.LittleEndian, &optionalHeader64)
-		if err != nil {
+	base, err := getBase(ioFile)
+	if err != nil {
+		if verbose {
+			fmt.Printf("[-] Could not read Image Header: %s\n", err)
+		}
+		return
+	}
+
+	peFile, err := pe.Open(name)
+	if err != nil {
+		return
+	}
+
+	sectionReader := io.NewSectionReader(ioFile, 0, 1<<63-1)
+	err = readFileHeader(sectionReader, base, peFile)
+	if err != nil {
+		if verbose {
+			fmt.Printf("[-] Could read Image File Header: %s\n", err)
+		}
+		return
+	}
+
+	is64bit, err = readImageOptionalHeader(peFile, sectionReader, &optionalHeader32, &optionalHeader64)
+	if err != nil {
+		if verbose {
 			fmt.Printf("[-] Could not read Image Optional Header: %s\n", err)
-			return
 		}
-		if optionalHeader64.Magic != 0x20b { // PE32+
-			fmt.Printf("[-] pe32+ optional header has unexpected Magic of 0x%x\n", optionalHeader64.Magic)
-			return
-		}
-		is64bit = true
+		return
 	}
 
 	if is64bit {
-		if optionalHeader64.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_NX_COMPAT == 0 {
-			noNx = true
-		}
-		if optionalHeader64.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE == 0 {
-			noAslr = true
-		}
-		if optionalHeader64.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_NO_SEH != 0 {
-			noSeh = true
-		}
-		if optionalHeader64.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_GUARD_CF == 0 {
-			noCfg = true
-		}
-		if optionalHeader64.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY == 0 {
-			noIntegrityChecks = true
-		}
+		noNx, noAslr, noSeh, noCfg, noIntegrityChecks = checkCharacteristics(optionalHeader64.DllCharacteristics)
 	} else {
-		if optionalHeader32.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_NX_COMPAT == 0 {
-			noNx = true
-		}
-		if optionalHeader32.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE == 0 {
-			noAslr = true
-		}
-		if optionalHeader32.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_NO_SEH != 0 {
-			noSeh = true
-		}
-		if optionalHeader32.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_GUARD_CF == 0 {
-			noCfg = true
-		}
-		if optionalHeader32.DllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY == 0 {
-			noIntegrityChecks = true
-		}
+		noNx, noAslr, noSeh, noCfg, noIntegrityChecks = checkCharacteristics(optionalHeader32.DllCharacteristics)
 	}
+
 	if noNx {
 		fmt.Printf("[+] [No NX] %s\n", name)
 	}
@@ -175,30 +123,134 @@ func check(name string, allChecks bool, verbose bool) {
 
 }
 
+func checkCharacteristics(dllCharacteristics uint16) (bool, bool, bool, bool, bool) {
+	var (
+		noNx              bool
+		noAslr            bool
+		noSeh             bool
+		noCfg             bool
+		noIntegrityChecks bool
+	)
+	if dllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_NX_COMPAT == 0 {
+		noNx = true
+	}
+	if dllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE == 0 {
+		noAslr = true
+	}
+	if dllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_NO_SEH != 0 {
+		noSeh = true
+	}
+	if dllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_GUARD_CF == 0 {
+		noCfg = true
+	}
+	if dllCharacteristics&pe.IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY == 0 {
+		noIntegrityChecks = true
+	}
+	return noNx, noAslr, noSeh, noCfg, noIntegrityChecks
+}
+
+func readImageOptionalHeader(peFile *pe.File, sectionReader *io.SectionReader, optionalHeader32 *pe.OptionalHeader32, optionalHeader64 *pe.OptionalHeader64) (bool, error) {
+	var (
+		sizeofOptionalHeader32 = uint16(binary.Size(pe.OptionalHeader32{}))
+		sizeofOptionalHeader64 = uint16(binary.Size(pe.OptionalHeader64{}))
+	)
+
+	switch peFile.FileHeader.SizeOfOptionalHeader {
+	case sizeofOptionalHeader32:
+		err := binary.Read(sectionReader, binary.LittleEndian, optionalHeader32)
+		if err != nil {
+			return false, err
+		}
+		if optionalHeader32.Magic != 0x10b {
+			return false, fmt.Errorf("unexpected magic byte: %d", optionalHeader32.Magic)
+		}
+		return false, nil
+
+	case sizeofOptionalHeader64:
+		err := binary.Read(sectionReader, binary.LittleEndian, optionalHeader64)
+		if err != nil {
+			return false, err
+		}
+		if optionalHeader64.Magic != 0x20b {
+			return false, fmt.Errorf("unexpected magic byte: %d", optionalHeader64.Magic)
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("unexpected optional header size: %d", peFile.FileHeader.SizeOfOptionalHeader)
+	}
+
+}
+
+func readFileHeader(sectionReader *io.SectionReader, base int64, peFile *pe.File) error {
+	_, err := sectionReader.Seek(base, io.SeekStart)
+	if err != nil {
+		return err
+	}
+	err = binary.Read(sectionReader, binary.LittleEndian, &peFile.FileHeader)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func getBase(ioFile *os.File) (int64, error) {
+	var dosHeader [96]byte
+	var sign [4]byte
+	_, err := ioFile.ReadAt(dosHeader[0:], 0)
+	if err != nil {
+		return 0, err
+	}
+	var base int64
+	if dosHeader[0] == 'M' && dosHeader[1] == 'Z' {
+		signOff := int64(binary.LittleEndian.Uint32(dosHeader[0x3c:]))
+		_, err := ioFile.ReadAt(sign[:], signOff)
+		if err != nil {
+			return 0, err
+		}
+		if !(sign[0] == 'P' && sign[1] == 'E' && sign[2] == 0 && sign[3] == 0) {
+		}
+		base = signOff + 4
+	} else {
+		base = int64(0)
+	}
+	return base, nil
+}
+
 type config struct {
 	paths     string
 	allChecks bool
 	verbose   bool
+	justExes  bool
+	justDlls  bool
 }
 
 func getConfig() config {
 
 	flags := flag.NewFlagSet("go-hunt-weak-pes", flag.ExitOnError)
 
-	paths := flags.String("paths", "", "The comma separated list of paths to check")
-	allChecks := flags.Bool("allChecks", false, "Perform checks for canaries and retguard in addition to DEP and ASLR")
-	verbose := flags.Bool("verbose", false, "Verbose mode (defaults to false)")
+	pPaths := flags.String("paths", "", "The comma separated list of paths to checkPE")
+	pAllChecks := flags.Bool("allChecks", false, "Perform checks for canaries and retguard in addition to DEP and ASLR")
+	pVerbose := flags.Bool("verbose", false, "Verbose mode (defaults to false)")
+	pJustExes := flags.Bool("exes", false, "Only search for EXEs")
+	pJustDlls := flags.Bool("dlls", false, "Only search for DLLs")
 
 	err := flags.Parse(os.Args[1:])
 	if err != nil {
 		panic(err)
 	}
 
-	if *paths == "" {
+	if *pPaths == "" {
 		fmt.Println("Usage: ")
 		flags.PrintDefaults()
 		os.Exit(1)
 	}
 
-	return config{paths: *paths, allChecks: *allChecks, verbose: *verbose}
+	if *pJustExes && *pJustDlls {
+		fmt.Println("-exes and -dlls cannot both be set at the same time")
+		fmt.Println("Usage: ")
+		flags.PrintDefaults()
+		os.Exit(1)
+	}
+
+	return config{paths: *pPaths, allChecks: *pAllChecks, verbose: *pVerbose, justExes: *pJustExes, justDlls: *pJustDlls}
 }
