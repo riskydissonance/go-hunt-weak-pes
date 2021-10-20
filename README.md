@@ -7,7 +7,7 @@ Go binary that finds .EXEs and .DLLs on the system that don't have security cont
 ```
 Usage of go-hunt-weak-pes:
   -allChecks
-        Perform checks for canaries and retguard in addition to DEP and ASLR
+        Perform checks for SEH, CFG and Integrity Checking in addition to DEP and ASLR
   -dlls
         Only search for DLLs
   -exes

@@ -229,7 +229,7 @@ func getConfig() config {
 	flags := flag.NewFlagSet("go-hunt-weak-pes", flag.ExitOnError)
 
 	pPaths := flags.String("paths", "", "The comma separated list of paths to checkPE")
-	pAllChecks := flags.Bool("allChecks", false, "Perform checks for canaries and retguard in addition to DEP and ASLR")
+	pAllChecks := flags.Bool("allChecks", false, "Perform checks for SEH, CFG and Integrity Checking in addition to DEP and ASLR")
 	pVerbose := flags.Bool("verbose", false, "Verbose mode (defaults to false)")
 	pJustExes := flags.Bool("exes", false, "Only search for EXEs")
 	pJustDlls := flags.Bool("dlls", false, "Only search for DLLs")
